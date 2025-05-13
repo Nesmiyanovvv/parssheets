@@ -1,21 +1,35 @@
 import gspread
+import psycopg2
 import requests
 import json
-from datetime import datetime
+import time
 import uuid
+from datetime import datetime
 from oauth2client.service_account import ServiceAccountCredentials
+from iam import get_iam_token
+
+
+# Настройка подключения к БД
+DB_CONFIG = {
+    "dbname": "db_name",
+    "user": "user",
+    "password": "password",
+    "host": "localhost",
+    "port": 5432
+}
 
 # Настройки
-GOOGLE_CREDS = "credentials.json"  # Путь к файлу с ключами от Google
-SPREADSHEET_ID = "1UDGVsRM_IekTKjCgFWRmo8W0CiRiA0KNUO2lTJQIcW0"  # ID таблицы
-YC_IAM_TOKEN = "t1.9euelZqWyI_NjY3Ox5vIm5yZyImZzO3rnpWal5iTjcqOlpednpqOkJPLnYnl8_dlfUFA-e9NAxEK_t3z9yUsP0D5700DEQr-zef1656VmsudmJubm8uKx8abkY-YmJfN7_zN5_XrnpWak8aens2bk5aNlM_OlsaWi5Dv_cXrnpWay52Ym5uby4rHxpuRj5iYl80.YrPSOOK8IO-feo3ZBziBpDDeog69fY7PNp_vg9lvFSYBMK4FKEKBiWfKCVpwtIeiXOHqP8uq_I72v_jxQBSgDg"
-FOLDER_ID = "b1guh54hstiecdkcat8s"  # ← твой folder-id
-QUEUE_NAME = "dev-mq.fifo"  # Имя очереди
+GOOGLE_CREDS = "credentials.json"
+SPREADSHEET_ID = "1UDGVsRM_IekTKjCgFWRmo8W0CiRiA0KNUO2lTJQIcW0"
+YC_IAM_TOKEN = "твой_токен"
+QUEUE_NAME = "dev-mq.fifo"
 YC_QUEUE_URL = "https://message-queue.api.cloud.yandex.net/b1g0ca3i23kc5sdjfj23/dj6000000011jruh0068/dev-mq.fifo"
 
+# Глобальное хранилище данных для отслеживания изменений
+last_known_state = {}
 
-# 1. Парсинг Google Sheets
-def parse_sheets():
+
+def get_sheet_data():
     creds = ServiceAccountCredentials.from_json_keyfile_name(
         GOOGLE_CREDS, ["https://www.googleapis.com/auth/spreadsheets"]
     )
@@ -30,34 +44,47 @@ def parse_sheets():
 
     if ready_col is None or id_col is None:
         print("❌ Столбец 'Готово' или 'ID' не найден")
-        return []
+        return [], headers, sheet, ready_col, id_col
 
-    data_to_send = []
-    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
+    data = []
     for i, row in enumerate(rows[1:], start=2):
         if len(row) > ready_col and str(row[ready_col]).strip().upper() == "TRUE":
-            row_id = row[id_col] if len(row) > id_col else ""
+            data.append((i, dict(zip(headers, row))))
+    return data, headers, sheet, ready_col, id_col
 
-            # Считаем, что строка новая, если ID пустой
-            is_new = not row_id.strip()
 
-            if is_new:
-                row_id = str(uuid.uuid4())
-                sheet.update_cell(i, id_col + 1, row_id)
+def detect_changes(data, id_col, headers, sheet):
+    global last_known_state
+    updated_data = []
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-            # Обновляем дату в колонке L (12-я колонка)
-            sheet.update_cell(i, 12, now_str)
+    for row_index, row_dict in data:
+        row_id = row_dict.get("ID", "").strip()
 
-            # Собираем данные в словарь
-            row_data = dict(zip(headers, row))
-            row_data["ID"] = row_id
-            row_data["event_type"] = "create" if is_new else "update"
+        if not row_id:
+            row_id = str(uuid.uuid4())
+            sheet.update_cell(row_index, id_col + 1, row_id)
+            row_dict["ID"] = row_id
+            row_dict["event_type"] = "create"
+        else:
+            last = last_known_state.get(row_id)
+            current = tuple(row_dict.get(h, "") for h in headers)
 
-            data_to_send.append(row_data)
+            if last == current:
+                continue  # Пропускаем, если изменений нет
 
-    return data_to_send
-# 2. Отправка в YMQ
+            row_dict["event_type"] = "update"
+
+        # Обновляем дату в колонке L
+        sheet.update_cell(row_index, 12, now_str)
+
+        current_state = tuple(row_dict.get(h, "") for h in headers)
+        last_known_state[row_id] = current_state
+        updated_data.append(row_dict)
+
+    return updated_data
+
+
 def send_to_ymq(data):
     messages = [
         {
@@ -66,10 +93,12 @@ def send_to_ymq(data):
         } for row in data
     ]
 
+    token = get_iam_token()
+
     response = requests.post(
         f"{YC_QUEUE_URL}/messages",
         headers={
-            "Authorization": f"Bearer {YC_IAM_TOKEN}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         },
         json={"messages": messages}
@@ -79,12 +108,81 @@ def send_to_ymq(data):
     print("📩 Ответ:", response.text)
     return response.status_code == 200
 
-# 3. Главная функция
+
+def save_to_postgres(data):
+    conn = None
+    cursor = None
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+
+        for row in data:
+            cursor.execute("""
+                INSERT INTO vms_data (
+                    id, zakaz, importer, client, status, container_number,
+                    container_size, cargo, waybill_number, client_order_number, file_url
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE
+                SET zakaz = EXCLUDED.zakaz,
+                    importer = EXCLUDED.importer,
+                    client = EXCLUDED.client,
+                    status = EXCLUDED.status,
+                    container_number = EXCLUDED.container_number,
+                    container_size = EXCLUDED.container_size,
+                    cargo = EXCLUDED.cargo,
+                    waybill_number = EXCLUDED.waybill_number,
+                    client_order_number = EXCLUDED.client_order_number,
+                    file_url = EXCLUDED.file_url;
+            """, (
+                row.get("ID"),
+                row.get("Заказ"),
+                row.get("Импортёр"),
+                row.get("Клиент"),
+                row.get("Статус"),
+                row.get("№ Контейнера"),
+                row.get("Типоразмер контейнера"),
+                row.get("Груз"),
+                row.get("№ накладной"),
+                row.get("№ Заказа клиента"),
+                row.get("Загрузить"),
+            ))
+
+        conn.commit()
+        print(f"🗄️ В базу данных добавлено или обновлено {len(data)} строк.")
+
+    except Exception as e:
+        print(f"❌ Ошибка при сохранении в БД: {e}")
+
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+
+def main_loop():
+    print("🚀 Запуск парсера. Проверка каждые 5 минут.")
+    while True:
+        try:
+            data, headers, sheet, ready_col, id_col = get_sheet_data()
+            if not data:
+                print("🤷 Нет строк с отметкой 'Готово'")
+            else:
+                updated = detect_changes(data, id_col, headers, sheet)
+                if updated:
+                    if send_to_ymq(updated):
+                        print(f"✅ Отправлено {len(updated)} строк.")
+                        save_to_postgres(updated)
+                    else:
+                        print("❌ Ошибка при отправке.")
+                else:
+                    print("🔁 Нет изменений.")
+        except Exception as e:
+            print(f"💥 Ошибка: {e}")
+
+        time.sleep(300)  # 5 минут
+
+
 if __name__ == "__main__":
-    data = parse_sheets()
-    if not data:
-        print("🤷 Нет данных для отправки")
-    elif send_to_ymq(data):
-        print(f"✅ Успешно отправлено {len(data)} строк в очередь!")
-    else:
-        print("❌ Ошибка при отправке")
+    main_loop()
