@@ -1,90 +1,90 @@
 import gspread
+import requests
 import json
-import pandas as pd
-from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime
+import uuid
+from oauth2client.service_account import ServiceAccountCredentials
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
-          "https://www.googleapis.com/auth/drive"]
-SERVICE_ACCOUNT_FILE = "credentials.json"
-SPREADSHEET_ID = "1UDGVsRM_IekTKjCgFWRmo8W0CiRiA0KNUO2lTJQIcW0"
+# Настройки
+GOOGLE_CREDS = "credentials.json"  # Путь к файлу с ключами от Google
+SPREADSHEET_ID = "1UDGVsRM_IekTKjCgFWRmo8W0CiRiA0KNUO2lTJQIcW0"  # ID таблицы
+YC_IAM_TOKEN = "t1.9euelZqWyI_NjY3Ox5vIm5yZyImZzO3rnpWal5iTjcqOlpednpqOkJPLnYnl8_dlfUFA-e9NAxEK_t3z9yUsP0D5700DEQr-zef1656VmsudmJubm8uKx8abkY-YmJfN7_zN5_XrnpWak8aens2bk5aNlM_OlsaWi5Dv_cXrnpWay52Ym5uby4rHxpuRj5iYl80.YrPSOOK8IO-feo3ZBziBpDDeog69fY7PNp_vg9lvFSYBMK4FKEKBiWfKCVpwtIeiXOHqP8uq_I72v_jxQBSgDg"
+FOLDER_ID = "b1guh54hstiecdkcat8s"  # ← твой folder-id
+QUEUE_NAME = "dev-mq.fifo"  # Имя очереди
+YC_QUEUE_URL = "https://message-queue.api.cloud.yandex.net/b1g0ca3i23kc5sdjfj23/dj6000000011jruh0068/dev-mq.fifo"
 
-credentials = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, SCOPES)
-client = gspread.authorize(credentials)
 
-try:
-    spreadsheet = client.open_by_key(SPREADSHEET_ID)
-except Exception as e:
-    print(f"Ошибка при открытии таблицы: {e}")
-    exit()
+# 1. Парсинг Google Sheets
+def parse_sheets():
+    creds = ServiceAccountCredentials.from_json_keyfile_name(
+        GOOGLE_CREDS, ["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 
-data = {}
+    rows = sheet.get_all_values(value_render_option='UNFORMATTED_VALUE')
+    headers = rows[0]
 
-def convert_to_serializable(obj):
-    if pd.isna(obj) or obj == '':
-        return None
-    elif isinstance(obj, (pd.Timestamp, datetime)):
-        return obj.isoformat()
-    elif isinstance(obj, (bool, int, float, str)):
-        return obj
+    ready_col = headers.index("Готово") if "Готово" in headers else None
+    id_col = headers.index("ID") if "ID" in headers else None
+
+    if ready_col is None or id_col is None:
+        print("❌ Столбец 'Готово' или 'ID' не найден")
+        return []
+
+    data_to_send = []
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    for i, row in enumerate(rows[1:], start=2):
+        if len(row) > ready_col and str(row[ready_col]).strip().upper() == "TRUE":
+            row_id = row[id_col] if len(row) > id_col else ""
+
+            # Считаем, что строка новая, если ID пустой
+            is_new = not row_id.strip()
+
+            if is_new:
+                row_id = str(uuid.uuid4())
+                sheet.update_cell(i, id_col + 1, row_id)
+
+            # Обновляем дату в колонке L (12-я колонка)
+            sheet.update_cell(i, 12, now_str)
+
+            # Собираем данные в словарь
+            row_data = dict(zip(headers, row))
+            row_data["ID"] = row_id
+            row_data["event_type"] = "create" if is_new else "update"
+
+            data_to_send.append(row_data)
+
+    return data_to_send
+# 2. Отправка в YMQ
+def send_to_ymq(data):
+    messages = [
+        {
+            "body": json.dumps(row),
+            "message_group_id": "default"
+        } for row in data
+    ]
+
+    response = requests.post(
+        f"{YC_QUEUE_URL}/messages",
+        headers={
+            "Authorization": f"Bearer {YC_IAM_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        json={"messages": messages}
+    )
+
+    print("📦 Код ответа:", response.status_code)
+    print("📩 Ответ:", response.text)
+    return response.status_code == 200
+
+# 3. Главная функция
+if __name__ == "__main__":
+    data = parse_sheets()
+    if not data:
+        print("🤷 Нет данных для отправки")
+    elif send_to_ymq(data):
+        print(f"✅ Успешно отправлено {len(data)} строк в очередь!")
     else:
-        return str(obj)
-
-for sheet in spreadsheet.worksheets():
-    try:
-        rows = sheet.get_all_values()
-
-        if not rows:
-            print(f"Лист '{sheet.title}' пуст, пропускаем")
-            continue
-
-        headers = rows[0]
-
-        if len(rows) == 1:
-            print(f"Лист '{sheet.title}' содержит только заголовки")
-            data[sheet.title] = []
-            continue
-
-        df = pd.DataFrame(rows[1:], columns=headers)
-
-        for col in df.columns:
-            df[col] = df[col].apply(lambda x: True if str(x).strip() == '✔' else x)
-
-            df[col] = df[col].replace('', None)
-
-            if col.lower() in ['№ заказа клиента', 'номер заказа']:
-                df[col] = df[col].astype(str).str.strip()
-                continue
-
-            try:
-                if not df[col].empty and df[col].astype(str).str.match(r'^-?\d+\.?\d*$').all():
-                    df[col] = pd.to_numeric(df[col])
-            except Exception:
-                pass
-
-            try:
-                if not df[col].empty and any(df[col].astype(str).str.match(r'\d{1,2}[./-]\d{1,2}[./-]\d{2,4}')):
-                    df[col] = pd.to_datetime(df[col], format='mixed')
-            except Exception:
-                pass
-
-        sheet_data = []
-        for record in df.to_dict(orient='records'):
-            sheet_data.append({
-                k: convert_to_serializable(v)
-                for k, v in record.items()
-            })
-
-        data[sheet.title] = sheet_data
-
-    except Exception as e:
-        print(f"Ошибка при обработке листа '{sheet.title}': {e}")
-        continue
-
-output_file = "spreadsheet_data.json"
-try:
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-    print(f"Данные успешно сохранены в {output_file}")
-except Exception as e:
-    print(f"Ошибка при сохранении файла: {e}")
+        print("❌ Ошибка при отправке")
